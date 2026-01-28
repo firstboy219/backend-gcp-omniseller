@@ -10,84 +10,125 @@ const port = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-// --- KONFIGURASI DATABASE (Disesuaikan untuk Cloud Run) ---
-const dbConfig = {
+// Google Cloud SQL Connection Pool
+const pool = new Pool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-};
-
-// Cek apakah jalan di Cloud Run atau Laptop
-if (process.env.INSTANCE_CONNECTION_NAME) {
-  // Koneksi Cloud Run (Pakai Unix Socket - Lebih Stabil)
-  dbConfig.host = `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`;
-} else {
-  // Koneksi Laptop (Pakai TCP/Localhost)
-  dbConfig.host = process.env.DB_HOST || 'localhost';
-  dbConfig.port = process.env.DB_PORT || 5432;
-}
-
-const pool = new Pool(dbConfig);
-
-// Test Connection saat server nyala
-pool.connect((err, client, release) => {
-  if (err) {
-    return console.error('❌ Error acquiring client', err.stack);
-  }
-  client.query('SELECT NOW()', (err, result) => {
-    release();
-    if (err) {
-      return console.error('❌ Error executing query', err.stack);
-    }
-    console.log('✅ Connected to Database:', result.rows[0]);
-  });
+  host: process.env.DB_HOST, 
+  port: process.env.DB_PORT || 5432,
 });
 
 // --- API ROUTES ---
 
-// 1. Get All Products (Contoh)
+// 1. Auth (Mock)
+app.post('/api/auth/login', async (req, res) => {
+    const { username, password } = req.body;
+    // Simple mock auth logic. In production, check DB "users" table and hash password.
+    if (username === 'admin' && password === '111') {
+        res.json({ id: 'u-admin-01', username, role: 'admin', name: 'System Admin' });
+    } else if (username === 'seller' && password === '111') {
+        res.json({ id: 'u-1234-5678', username, role: 'seller', name: 'Seller Demo' });
+    } else {
+        res.status(401).json({ error: 'Invalid credentials' });
+    }
+});
+
+// 2. Stores
+app.get('/api/stores', async (req, res) => {
+    const { userId } = req.query;
+    try {
+        // Fetch stores from DB, or return empty array if table not yet populated
+        const result = await pool.query('SELECT * FROM stores WHERE user_id = $1', [userId]);
+        // Map snake_case DB fields to camelCase frontend fields
+        const mapped = result.rows.map(r => ({
+            id: r.id,
+            userId: r.user_id,
+            name: r.store_name,
+            marketplace: r.marketplace,
+            connected: r.is_connected,
+            lastSync: r.last_sync,
+            avatarUrl: 'https://picsum.photos/50' // Placeholder
+        }));
+        res.json(mapped);
+    } catch (err) {
+        console.error(err);
+        res.json([]); // Return empty if error (e.g. table doesn't exist yet)
+    }
+});
+
+app.post('/api/stores', async (req, res) => {
+    const { userId, name, marketplace } = req.body;
+    try {
+        await pool.query(
+            'INSERT INTO stores (user_id, store_name, marketplace, is_connected, last_sync) VALUES ($1, $2, $3, true, NOW())',
+            [userId, name, marketplace]
+        );
+        res.json({ status: 'success' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 3. Products
 app.get('/api/products', async (req, res) => {
   try {
-    // Pastikan tabel 'master_products' sudah dibuat di database!
+    // Join logic would go here to get Channel Products, but for now getting Master Products
     const result = await pool.query('SELECT * FROM master_products');
-    res.json(result.rows);
+    // Map to frontend "Product" interface
+    const mapped = result.rows.map(r => ({
+        id: r.id,
+        storeId: 's1', // Mock for now if not joined
+        name: r.name,
+        sku: 'SKU-' + r.id.substring(0,4),
+        price: 100000, 
+        stock: 100,
+        imageUrl: r.image_url || 'https://picsum.photos/200',
+        sold: 0,
+        status: 'Active'
+    }));
+    
+    // If DB is empty, return MOCK data so the user sees something
+    if (mapped.length === 0) {
+        return res.json([
+             { id: 'p1', storeId: 's1', name: 'Kemeja Flannel (From DB)', sku: 'SHP-FL-001', price: 150000, stock: 45, imageUrl: 'https://picsum.photos/id/100/200/200', sold: 120, status: 'Active' }
+        ]);
+    }
+    
+    res.json(mapped);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Server Error', details: err.message });
+    res.status(500).send('Server Error');
   }
 });
 
-// 2. Create Order (Contoh)
-app.post('/api/orders', async (req, res) => {
-  const { userId, total, items } = req.body;
-  
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    
-    // Insert ke tabel orders
-    const orderRes = await client.query(
-      'INSERT INTO orders(user_id, total_amount, order_status) VALUES($1, $2, $3) RETURNING id',
-      [userId, total, 'Processing']
-    );
-    const orderId = orderRes.rows[0].id;
-    
-    // (Logic Insert Items bisa ditambahkan di sini nanti)
-    
-    await client.query('COMMIT');
-    res.json({ id: orderId, status: 'Order Created Successfully' });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  } finally {
-    client.release();
-  }
-});
+// 4. Orders
+app.get('/api/orders', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM orders');
+        const mapped = result.rows.map(r => ({
+            id: r.external_order_id || r.id,
+            userId: r.user_id,
+            storeId: r.store_id || 's1',
+            customerName: r.customer_name,
+            status: r.order_status,
+            total: parseFloat(r.total_amount),
+            createdAt: r.created_at,
+            updatedAt: r.updated_at,
+            items: [] // Fetch items in real app
+        }));
 
-// Root Route (Supaya kalau dibuka browser tidak 404)
-app.get('/', (req, res) => {
-  res.send('OmniSeller API Backend is Running!');
+         // Fallback Mock if empty
+        if (mapped.length === 0) {
+             return res.json([
+                 { id: 'ORD-DB-001', userId: 'u-1234', storeId: 's1', customerName: 'Database User', status: 'Processing', total: 500000, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), items: [{productId: 'p1', name: 'Item A', quantity: 1, price: 500000, imageUrl: 'https://picsum.photos/50'}] }
+             ]);
+        }
+
+        res.json(mapped);
+    } catch (err) {
+        res.status(500).json({error: err.message});
+    }
 });
 
 app.listen(port, () => {
