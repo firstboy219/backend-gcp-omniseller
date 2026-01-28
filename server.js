@@ -8,6 +8,7 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 8080;
 
+// Enable CORS for all origins
 app.use(cors());
 app.use(express.json());
 
@@ -44,11 +45,54 @@ app.get('/', (req, res) => {
     res.status(200).send(`
         <h1>🟢 OmniSeller Backend is Live!</h1>
         <p>Your server is running correctly.</p>
-        <p><strong>Version:</strong> 2.1 (Enhanced Logging)</p>
+        <p><strong>Version:</strong> 2.2 (DB Login Enabled)</p>
     `);
 });
 
-// 1. Auth Callback (TIKTOK)
+// 1. AUTH LOGIN (UPDATED: Uses Database)
+app.post('/api/auth/login', async (req, res) => {
+    const { username, password } = req.body;
+    console.log("Login attempt:", username);
+    
+    try {
+        // Check DB for user
+        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        
+        if (result.rows.length > 0) {
+            const user = result.rows[0];
+            // WARNING: In production, use bcrypt.compare(password, user.password_hash)
+            // For this demo with '111', direct comparison matches seed data.
+            if (user.password_hash === password) {
+                 console.log("Login success:", username);
+                 res.json({
+                    id: user.id,
+                    username: user.username,
+                    role: user.role,
+                    name: user.username === 'admin' ? 'System Admin' : 'Seller Account',
+                    email: user.email
+                 });
+                 return;
+            }
+        }
+        
+        console.log("Login failed: Invalid credentials for", username);
+        res.status(401).json({ error: "Invalid credentials" });
+        
+    } catch (e) {
+        console.error("Login DB Error:", e);
+        // Fallback to hardcoded if DB fails (Emergency Access)
+        if ((username === 'admin' && password === '111') || (username === 'seller' && password === '111')) {
+             console.log("Login success (Fallback Mode)");
+             const role = username === 'admin' ? 'admin' : 'seller';
+             const id = username === 'admin' ? 'u-admin-01' : 'u-1234-5678';
+             res.json({ id, username, role, name: username === 'admin' ? 'System Admin' : 'Demo Seller' });
+        } else {
+             res.status(500).json({ error: "Database Error: " + e.message });
+        }
+    }
+});
+
+// 2. Auth Callback (TIKTOK)
 app.get('/api/auth/callback/tiktok', async (req, res) => {
     const { code, state } = req.query;
     console.log("Received TikTok Callback. Code present?", !!code);
@@ -59,26 +103,20 @@ app.get('/api/auth/callback/tiktok', async (req, res) => {
     try {
         const stateObj = JSON.parse(Buffer.from(state, 'base64').toString());
         userId = stateObj.u;
-        console.log("Callback for UserID:", userId);
     } catch (e) { 
-        console.error("State parse error:", e);
         return res.status(400).send("Error: Invalid State parameter."); 
     }
 
     try {
-        // 1. Get App Credentials
         const configRes = await pool.query('SELECT * FROM marketplace_configs WHERE user_id = $1 AND marketplace = $2', [userId, 'TikTok Shop']);
         
         if (configRes.rows.length === 0) {
-            console.error("CONFIG MISSING: No TikTok config found for user", userId);
-            console.error("Tip: Ensure you clicked 'Save to Cloud' in Admin Settings.");
-            return res.status(400).send("Configuration Missing: App Key/Secret not found in DB. Did you save settings in System Admin?");
+            return res.status(400).send("Configuration Missing: App Key/Secret not found in DB. Please Save Settings in Admin Panel first.");
         }
         
         const { app_key, app_secret } = configRes.rows[0];
-        console.log("Credentials found. Exchanging token...");
-
-        // 2. Exchange Code for Token
+        
+        // Exchange Token
         const tokenUrl = 'https://auth.tiktok-shops.com/api/v2/token/get';
         const response = await axios.get(tokenUrl, {
             params: {
@@ -91,16 +129,14 @@ app.get('/api/auth/callback/tiktok', async (req, res) => {
 
         const data = response.data;
         if (data.code !== 0) {
-            console.error("TikTok Token Error:", data);
             return res.status(500).send(`TikTok API Error: ${data.message}`);
         }
 
         const tokenData = data.data;
         const shopId = tokenData.shop_cipher;
         const shopName = tokenData.seller_name || `TikTok Shop (${shopId.substring(0,6)}...)`;
-        console.log("Token received for Shop:", shopName);
 
-        // 3. Save to DB
+        // Upsert Store
         const checkStore = await pool.query('SELECT id FROM stores WHERE user_id = $1 AND marketplace_shop_id = $2', [userId, shopId]);
 
         if (checkStore.rows.length > 0) {
@@ -116,22 +152,12 @@ app.get('/api/auth/callback/tiktok', async (req, res) => {
             );
         }
 
-        // 4. Success Page
         res.send(`
             <html>
-                <head>
-                    <title>Connection Successful</title>
-                    <style>
-                        body { font-family: sans-serif; text-align: center; padding-top: 50px; background: #f0fdf4; color: #166534; }
-                        .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>✅ Connected Successfully!</h1>
-                        <p>TikTok Shop <strong>${shopName}</strong> has been linked.</p>
-                        <p>You can close this window and refresh your OmniSeller dashboard.</p>
-                    </div>
+                <head><title>Connected</title></head>
+                <body style="text-align:center; padding:50px; font-family:sans-serif; background:#f0fdf4; color:#166534;">
+                    <h1>✅ Connected!</h1>
+                    <p>TikTok Shop <strong>${shopName}</strong> linked.</p>
                     <script>window.opener && window.opener.postMessage('tiktok-connected', '*');</script>
                 </body>
             </html>
@@ -143,27 +169,16 @@ app.get('/api/auth/callback/tiktok', async (req, res) => {
     }
 });
 
-// 2. GET PRODUCTS
+// 3. GET DATA ROUTES
 app.get('/api/products', async (req, res) => {
-    const { userId } = req.query;
-    try {
-        // ... (Full Logic Placeholder - ensure you copy the full logic from previous versions)
-        const stores = await pool.query("SELECT * FROM stores WHERE user_id = $1 AND is_connected = TRUE AND marketplace = 'TikTok Shop'", [userId]);
-        const config = await pool.query("SELECT * FROM marketplace_configs WHERE user_id = $1 AND marketplace = 'TikTok Shop'", [userId]);
-        
-        if (stores.rows.length === 0 || config.rows.length === 0) return res.json([]); 
-        
-        // Return dummy data for now to confirm connection if fetch fails
-        return res.json([]);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    // Placeholder: Return empty array or mock data until real sync logic is added
+    res.json([]); 
 });
 
-// 3. GET ORDERS
 app.get('/api/orders', async (req, res) => {
     res.json([]); 
 });
 
-// 4. Standard Routes
 app.get('/api/stores', async (req, res) => {
     const { userId } = req.query;
     try {
@@ -183,15 +198,7 @@ app.post('/api/stores', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/auth/login', async (req, res) => {
-    const { username, password } = req.body;
-    if ((username === 'admin' && password === '111') || (username === 'seller' && password === '111')) {
-        const role = username === 'admin' ? 'admin' : 'seller';
-        const id = username === 'admin' ? 'u-admin-01' : 'u-1234-5678';
-        res.json({ id, username, role, name: username === 'admin' ? 'System Admin' : 'Demo Seller' });
-    } else { res.status(401).json({ error: "Invalid credentials" }); }
-});
-
+// 4. SETTINGS ROUTES
 app.get('/api/settings', async (req, res) => {
     const { userId } = req.query;
     try {
@@ -207,16 +214,13 @@ app.get('/api/settings', async (req, res) => {
     } catch(e) { res.status(500).json({error: e.message}); }
 });
 
-// SAVE SETTINGS - CRITICAL for "Configuration Missing" Fix
 app.post('/api/settings', async (req, res) => {
     const { userId, settings } = req.body;
-    console.log("Saving settings for user:", userId);
     try {
         const client = await pool.connect();
         try {
             await client.query('BEGIN');
             for (const [marketplace, config] of Object.entries(settings)) {
-                // Ensure service_id is saved
                 await client.query(`
                     INSERT INTO marketplace_configs (user_id, marketplace, app_key, app_secret, service_id, webhook_secret, api_url)
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -225,17 +229,17 @@ app.post('/api/settings', async (req, res) => {
                 `, [userId, marketplace, config.appKey, config.appSecret, config.serviceId, config.webhookSecret, config.apiUrl]);
             }
             await client.query('COMMIT');
-            console.log("Settings saved successfully.");
             res.json({ success: true, message: "Cloud DB Updated" });
         } catch (e) { 
             await client.query('ROLLBACK'); 
-            console.error("Save Settings Failed:", e);
             throw e; 
         } finally { client.release(); }
     } catch(e) { res.status(500).json({error: e.message}); }
 });
 
+// TEST CONNECTION ENDPOINT
 app.post('/api/settings/test', async (req, res) => {
+    console.log("Test connection received");
     res.json({ success: true, message: "Backend is reachable & updated." });
 });
 
