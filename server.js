@@ -45,23 +45,20 @@ app.get('/', (req, res) => {
     res.status(200).send(`
         <h1>🟢 OmniSeller Backend is Live!</h1>
         <p>Your server is running correctly.</p>
-        <p><strong>Version:</strong> 2.2 (DB Login Enabled)</p>
+        <p><strong>Version:</strong> 2.4 (Auto-Close Popup)</p>
     `);
 });
 
-// 1. AUTH LOGIN (UPDATED: Uses Database)
+// 1. AUTH LOGIN
 app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
     console.log("Login attempt:", username);
     
     try {
-        // Check DB for user
         const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
         
         if (result.rows.length > 0) {
             const user = result.rows[0];
-            // WARNING: In production, use bcrypt.compare(password, user.password_hash)
-            // For this demo with '111', direct comparison matches seed data.
             if (user.password_hash === password) {
                  console.log("Login success:", username);
                  res.json({
@@ -74,15 +71,12 @@ app.post('/api/auth/login', async (req, res) => {
                  return;
             }
         }
-        
-        console.log("Login failed: Invalid credentials for", username);
         res.status(401).json({ error: "Invalid credentials" });
         
     } catch (e) {
         console.error("Login DB Error:", e);
-        // Fallback to hardcoded if DB fails (Emergency Access)
+        // Fallback for Demo
         if ((username === 'admin' && password === '111') || (username === 'seller' && password === '111')) {
-             console.log("Login success (Fallback Mode)");
              const role = username === 'admin' ? 'admin' : 'seller';
              const id = username === 'admin' ? 'u-admin-01' : 'u-1234-5678';
              res.json({ id, username, role, name: username === 'admin' ? 'System Admin' : 'Demo Seller' });
@@ -92,7 +86,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// 2. Auth Callback (TIKTOK)
+// 2. Auth Callback (TIKTOK) - LOGIC FIX: USE ADMIN CREDENTIALS
 app.get('/api/auth/callback/tiktok', async (req, res) => {
     const { code, state } = req.query;
     console.log("Received TikTok Callback. Code present?", !!code);
@@ -102,16 +96,18 @@ app.get('/api/auth/callback/tiktok', async (req, res) => {
     let userId;
     try {
         const stateObj = JSON.parse(Buffer.from(state, 'base64').toString());
-        userId = stateObj.u;
+        userId = stateObj.u; // Valid User ID (Seller) who initiated the request
     } catch (e) { 
         return res.status(400).send("Error: Invalid State parameter."); 
     }
 
     try {
-        const configRes = await pool.query('SELECT * FROM marketplace_configs WHERE user_id = $1 AND marketplace = $2', [userId, 'TikTok Shop']);
+        // FIX: Fetch credentials from ADMIN ('u-admin-01'), not the seller.
+        // The App Key/Secret belongs to the SaaS Platform (Admin), not the Seller.
+        const configRes = await pool.query('SELECT * FROM marketplace_configs WHERE user_id = $1 AND marketplace = $2', ['u-admin-01', 'TikTok Shop']);
         
         if (configRes.rows.length === 0) {
-            return res.status(400).send("Configuration Missing: App Key/Secret not found in DB. Please Save Settings in Admin Panel first.");
+            return res.status(400).send("System Error: Admin has not configured TikTok App Key/Secret yet.");
         }
         
         const { app_key, app_secret } = configRes.rows[0];
@@ -136,7 +132,7 @@ app.get('/api/auth/callback/tiktok', async (req, res) => {
         const shopId = tokenData.shop_cipher;
         const shopName = tokenData.seller_name || `TikTok Shop (${shopId.substring(0,6)}...)`;
 
-        // Upsert Store
+        // Upsert Store (Linked to the SELLER userId, not Admin)
         const checkStore = await pool.query('SELECT id FROM stores WHERE user_id = $1 AND marketplace_shop_id = $2', [userId, shopId]);
 
         if (checkStore.rows.length > 0) {
@@ -155,10 +151,26 @@ app.get('/api/auth/callback/tiktok', async (req, res) => {
         res.send(`
             <html>
                 <head><title>Connected</title></head>
-                <body style="text-align:center; padding:50px; font-family:sans-serif; background:#f0fdf4; color:#166534;">
-                    <h1>✅ Connected!</h1>
-                    <p>TikTok Shop <strong>${shopName}</strong> linked.</p>
-                    <script>window.opener && window.opener.postMessage('tiktok-connected', '*');</script>
+                <body style="text-align:center; padding:50px; font-family:sans-serif; background:#f0fdf4; color:#166534; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
+                    <h1 style="font-size:3rem; margin-bottom:10px;">✅</h1>
+                    <h2 style="margin-top:0;">Connected Successfully!</h2>
+                    <p>TikTok Shop <strong>${shopName}</strong> has been linked.</p>
+                    <p style="color:#666; font-size:0.9rem;">Redirecting to Store Management...</p>
+                    
+                    <button onclick="window.close()" style="margin-top:20px; padding:10px 20px; background:#166534; color:white; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">
+                        Close Window
+                    </button>
+
+                    <script>
+                        // Notify Parent Window (The React App)
+                        if (window.opener) {
+                            window.opener.postMessage('tiktok-connected', '*');
+                            // Attempt to close self after 1.5 seconds
+                            setTimeout(() => {
+                                window.close();
+                            }, 1500);
+                        }
+                    </script>
                 </body>
             </html>
         `);
@@ -171,7 +183,6 @@ app.get('/api/auth/callback/tiktok', async (req, res) => {
 
 // 3. GET DATA ROUTES
 app.get('/api/products', async (req, res) => {
-    // Placeholder: Return empty array or mock data until real sync logic is added
     res.json([]); 
 });
 
@@ -194,6 +205,16 @@ app.post('/api/stores', async (req, res) => {
     const { userId, name, marketplace } = req.body;
     try {
         await pool.query('INSERT INTO stores (user_id, marketplace, store_name, is_connected) VALUES ($1, $2, $3, $4)', [userId, marketplace, name, true]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE STORE ROUTE
+app.delete('/api/stores/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        // Cascade delete will handle related products/orders if setup correctly, otherwise manually delete
+        await pool.query('DELETE FROM stores WHERE id = $1', [id]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -237,10 +258,9 @@ app.post('/api/settings', async (req, res) => {
     } catch(e) { res.status(500).json({error: e.message}); }
 });
 
-// TEST CONNECTION ENDPOINT
+// TEST CONNECTION
 app.post('/api/settings/test', async (req, res) => {
-    console.log("Test connection received");
-    res.json({ success: true, message: "Backend is reachable & updated." });
+    res.json({ success: true, message: "Backend is reachable." });
 });
 
 app.listen(port, () => {
